@@ -261,6 +261,7 @@ describe('MCPOAuthProvider', () => {
       };
 
       const mockAuthServerMetadata = {
+        issuer: 'https://discovered.auth.com',
         authorization_endpoint: 'https://discovered.auth.com/authorize',
         token_endpoint: 'https://discovered.auth.com/token',
         scopes_supported: ['read', 'write'],
@@ -1650,6 +1651,7 @@ describe('MCPOAuthProvider', () => {
       };
 
       const mockAuthServerMetadata = {
+        issuer: 'https://discovered.auth.com',
         authorization_endpoint: 'https://discovered.auth.com/authorize',
         token_endpoint: 'https://discovered.auth.com/token',
         scopes_supported: ['discovered-scope'],
@@ -1739,6 +1741,7 @@ describe('MCPOAuthProvider', () => {
       };
 
       const mockAuthServerMetadata = {
+        issuer: 'https://discovered.auth.com',
         authorization_endpoint: 'https://discovered.auth.com/authorize',
         token_endpoint: 'https://discovered.auth.com/token',
         scopes_supported: ['discovered-scope-1', 'discovered-scope-2'],

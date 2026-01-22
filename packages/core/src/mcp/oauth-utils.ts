@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as ipaddr from 'ipaddr.js';
 import type { MCPOAuthConfig } from './oauth-provider.js';
 import { getErrorMessage } from '../utils/errors.js';
 import { debugLogger } from '../utils/debugLogger.js';
@@ -51,6 +52,110 @@ export interface OAuthProtectedResourceMetadata {
 export const FIVE_MIN_BUFFER_MS = 5 * 60 * 1000;
 
 /**
+ * Normalizes a URL by removing trailing slashes.
+ * Used for flexible URL comparison per RFC 9728.
+ *
+ * @param url The URL to normalize
+ * @returns The normalized URL without trailing slash
+ */
+function normalizeUrl(url: string): string {
+  return url.replace(/\/$/, '');
+}
+
+/**
+ * Classifies a hostname's IP address range.
+ * @returns The range type, or null if not an IP address (e.g., domain name)
+ */
+function classifyHostname(
+  hostname: string,
+): 'private' | 'public' | 'multicast' | 'broadcast' | 'reserved' | null {
+  if (hostname === 'localhost') {
+    return 'private';
+  }
+
+  try {
+    const addr = ipaddr.process(hostname);
+    const range = addr.range();
+
+    // Group private/local ranges together
+    if (
+      range === 'private' ||
+      range === 'loopback' ||
+      range === 'linkLocal' ||
+      range === 'uniqueLocal'
+    ) {
+      return 'private';
+    }
+
+    // Return specific dangerous ranges
+    if (
+      range === 'multicast' ||
+      range === 'broadcast' ||
+      range === 'reserved'
+    ) {
+      return range;
+    }
+
+    // Everything else is public
+    return 'public';
+  } catch {
+    // Not an IP address (domain name)
+    return null;
+  }
+}
+
+/**
+ * Validates a URL to prevent SSRF attacks.
+ * If the source URL (e.g., MCP server) is public, only allows public HTTPS URLs.
+ * If the source URL is local/private, allows local/private URLs as well.
+ *
+ * @param url The URL to validate
+ * @param sourceUrl The source URL (e.g., MCP server URL) to determine context
+ * @returns Error message if validation fails, null if valid
+ */
+function validateUrlForSSRF(url: string, sourceUrl?: string): string | null {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return `Invalid URL: ${url}`;
+  }
+
+  // Only allow HTTP/HTTPS protocols
+  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+    return `Only HTTP/HTTPS protocols are allowed: ${url}`;
+  }
+
+  // Classify target and source
+  const targetClass = classifyHostname(parsedUrl.hostname);
+  const sourceClass = sourceUrl
+    ? classifyHostname(new URL(sourceUrl).hostname)
+    : null;
+
+  // Block dangerous ranges immediately
+  if (
+    targetClass === 'multicast' ||
+    targetClass === 'broadcast' ||
+    targetClass === 'reserved'
+  ) {
+    return `${targetClass} address not allowed: ${parsedUrl.hostname}`;
+  }
+
+  // If target is private, only allow if source is also private
+  if (targetClass === 'private' && sourceClass !== 'private') {
+    return `Cannot fetch from local/private URL ${url} when source is public`;
+  }
+
+  // Allow HTTP only for local/private IPs (for development servers)
+  // Require HTTPS for public IPs and domain names
+  if (targetClass !== 'private' && parsedUrl.protocol !== 'https:') {
+    return `HTTPS is required for non-local URLs: ${url}`;
+  }
+
+  return null;
+}
+
+/**
  * Utility class for common OAuth operations.
  */
 export class OAuthUtils {
@@ -95,11 +200,22 @@ export class OAuthUtils {
    * Fetch OAuth protected resource metadata.
    *
    * @param resourceMetadataUrl The protected resource metadata URL
+   * @param sourceUrl Optional source URL for SSRF validation context
    * @returns The protected resource metadata or null if not available
    */
   static async fetchProtectedResourceMetadata(
     resourceMetadataUrl: string,
+    sourceUrl?: string,
   ): Promise<OAuthProtectedResourceMetadata | null> {
+    // Validate URL to prevent SSRF
+    const ssrfError = validateUrlForSSRF(resourceMetadataUrl, sourceUrl);
+    if (ssrfError) {
+      debugLogger.error(
+        `SSRF validation failed for protected resource metadata: ${ssrfError}`,
+      );
+      return null;
+    }
+
     try {
       const response = await fetch(resourceMetadataUrl);
       if (!response.ok) {
@@ -118,11 +234,22 @@ export class OAuthUtils {
    * Fetch OAuth authorization server metadata.
    *
    * @param authServerMetadataUrl The authorization server metadata URL
+   * @param sourceUrl Optional source URL for SSRF validation context
    * @returns The authorization server metadata or null if not available
    */
   static async fetchAuthorizationServerMetadata(
     authServerMetadataUrl: string,
+    sourceUrl?: string,
   ): Promise<OAuthAuthorizationServerMetadata | null> {
+    // Validate URL to prevent SSRF
+    const ssrfError = validateUrlForSSRF(authServerMetadataUrl, sourceUrl);
+    if (ssrfError) {
+      debugLogger.error(
+        `SSRF validation failed for authorization server metadata: ${ssrfError}`,
+      );
+      return null;
+    }
+
     try {
       const response = await fetch(authServerMetadataUrl);
       if (!response.ok) {
@@ -139,13 +266,36 @@ export class OAuthUtils {
 
   /**
    * Convert authorization server metadata to OAuth configuration.
+   * Validates all URLs to prevent SSRF attacks.
    *
    * @param metadata The authorization server metadata
+   * @param sourceUrl Optional source URL for SSRF validation context
    * @returns The OAuth configuration
+   * @throws Error if any URLs fail SSRF validation
    */
   static metadataToOAuthConfig(
     metadata: OAuthAuthorizationServerMetadata,
+    sourceUrl?: string,
   ): MCPOAuthConfig {
+    // Validate all URLs in the metadata to prevent SSRF
+    const urlsToValidate = [
+      { name: 'issuer', url: metadata.issuer },
+      { name: 'authorization_endpoint', url: metadata.authorization_endpoint },
+      { name: 'token_endpoint', url: metadata.token_endpoint },
+      { name: 'registration_endpoint', url: metadata.registration_endpoint },
+    ];
+
+    for (const { name, url } of urlsToValidate) {
+      if (url) {
+        const error = validateUrlForSSRF(url, sourceUrl);
+        if (error) {
+          throw new Error(
+            `Invalid ${name} in authorization server metadata: ${error}`,
+          );
+        }
+      }
+    }
+
     return {
       authorizationUrl: metadata.authorization_endpoint,
       issuer: metadata.issuer,
@@ -156,14 +306,16 @@ export class OAuthUtils {
   }
 
   /**
-   * Discover Oauth Authorization server metadata given an Auth server URL, by
+   * Discover OAuth Authorization server metadata given an Auth server URL, by
    * trying the standard well-known endpoints.
    *
    * @param authServerUrl The authorization server URL
+   * @param sourceUrl Optional source URL for SSRF validation context
    * @returns The authorization server metadata or null if not found
    */
   static async discoverAuthorizationServerMetadata(
     authServerUrl: string,
+    sourceUrl?: string,
   ): Promise<OAuthAuthorizationServerMetadata | null> {
     const authServerUrlObj = new URL(authServerUrl);
     const base = `${authServerUrlObj.protocol}//${authServerUrlObj.host}`;
@@ -212,8 +364,10 @@ export class OAuthUtils {
     );
 
     for (const endpoint of endpointsToTry) {
-      const authServerMetadata =
-        await this.fetchAuthorizationServerMetadata(endpoint);
+      const authServerMetadata = await this.fetchAuthorizationServerMetadata(
+        endpoint,
+        sourceUrl,
+      );
       if (authServerMetadata) {
         return authServerMetadata;
       }
@@ -228,7 +382,7 @@ export class OAuthUtils {
   /**
    * Discover OAuth configuration using the standard well-known endpoints.
    *
-   * @param serverUrl The base URL of the server
+   * @param serverUrl The base URL of the server (MCP server)
    * @returns The discovered OAuth configuration or null if not available
    */
   static async discoverOAuthConfig(
@@ -241,6 +395,7 @@ export class OAuthUtils {
       // Try to get the protected resource metadata at root
       let resourceMetadata = await this.fetchProtectedResourceMetadata(
         wellKnownUrls.protectedResource,
+        serverUrl,
       );
 
       // If root discovery fails and we have a path, try path-based discovery
@@ -250,6 +405,7 @@ export class OAuthUtils {
           const pathBasedUrls = this.buildWellKnownUrls(serverUrl, true);
           resourceMetadata = await this.fetchProtectedResourceMetadata(
             pathBasedUrls.protectedResource,
+            serverUrl,
           );
         }
       }
@@ -258,8 +414,12 @@ export class OAuthUtils {
         // RFC 9728 Section 7.3: The client MUST ensure that the resource identifier URL
         // it is using as the prefix for the metadata request exactly matches the value
         // of the resource metadata parameter in the protected resource metadata document.
+        // Note: We normalize trailing slashes to be flexible with server implementations
         const expectedResource = this.buildResourceParameter(serverUrl);
-        if (resourceMetadata.resource !== expectedResource) {
+        if (
+          normalizeUrl(resourceMetadata.resource) !==
+          normalizeUrl(expectedResource)
+        ) {
           throw new ResourceMismatchError(
             `Protected resource ${resourceMetadata.resource} does not match expected ${expectedResource}`,
           );
@@ -270,10 +430,16 @@ export class OAuthUtils {
         // Use the first authorization server
         const authServerUrl = resourceMetadata.authorization_servers[0];
         const authServerMetadata =
-          await this.discoverAuthorizationServerMetadata(authServerUrl);
+          await this.discoverAuthorizationServerMetadata(
+            authServerUrl,
+            serverUrl,
+          );
 
         if (authServerMetadata) {
-          const config = this.metadataToOAuthConfig(authServerMetadata);
+          const config = this.metadataToOAuthConfig(
+            authServerMetadata,
+            serverUrl,
+          );
           if (authServerMetadata.registration_endpoint) {
             debugLogger.log(
               'Dynamic client registration is supported at:',
@@ -286,11 +452,16 @@ export class OAuthUtils {
 
       // Fallback: try well-known endpoints at the base URL
       debugLogger.debug(`Trying OAuth discovery fallback at ${serverUrl}`);
-      const authServerMetadata =
-        await this.discoverAuthorizationServerMetadata(serverUrl);
+      const authServerMetadata = await this.discoverAuthorizationServerMetadata(
+        serverUrl,
+        serverUrl,
+      );
 
       if (authServerMetadata) {
-        const config = this.metadataToOAuthConfig(authServerMetadata);
+        const config = this.metadataToOAuthConfig(
+          authServerMetadata,
+          serverUrl,
+        );
         if (authServerMetadata.registration_endpoint) {
           debugLogger.log(
             'Dynamic client registration is supported at:',
@@ -344,13 +515,19 @@ export class OAuthUtils {
       return null;
     }
 
-    const resourceMetadata =
-      await this.fetchProtectedResourceMetadata(resourceMetadataUri);
+    const resourceMetadata = await this.fetchProtectedResourceMetadata(
+      resourceMetadataUri,
+      mcpServerUrl,
+    );
 
     if (resourceMetadata && mcpServerUrl) {
       // Validate resource parameter per RFC 9728 Section 7.3
+      // Note: We normalize trailing slashes to be flexible with server implementations
       const expectedResource = this.buildResourceParameter(mcpServerUrl);
-      if (resourceMetadata.resource !== expectedResource) {
+      if (
+        normalizeUrl(resourceMetadata.resource) !==
+        normalizeUrl(expectedResource)
+      ) {
         throw new ResourceMismatchError(
           `Protected resource ${resourceMetadata.resource} does not match expected ${expectedResource}`,
         );
@@ -362,11 +539,13 @@ export class OAuthUtils {
     }
 
     const authServerUrl = resourceMetadata.authorization_servers[0];
-    const authServerMetadata =
-      await this.discoverAuthorizationServerMetadata(authServerUrl);
+    const authServerMetadata = await this.discoverAuthorizationServerMetadata(
+      authServerUrl,
+      mcpServerUrl,
+    );
 
     if (authServerMetadata) {
-      return this.metadataToOAuthConfig(authServerMetadata);
+      return this.metadataToOAuthConfig(authServerMetadata, mcpServerUrl);
     }
 
     return null;
@@ -395,13 +574,15 @@ export class OAuthUtils {
 
   /**
    * Build a resource parameter for OAuth requests.
+   * Per RFC 9728, the resource parameter should not include a trailing slash for root paths.
    *
    * @param endpointUrl The endpoint URL
    * @returns The resource parameter value
    */
   static buildResourceParameter(endpointUrl: string): string {
     const url = new URL(endpointUrl);
-    return `${url.protocol}//${url.host}${url.pathname}`;
+    const pathname = url.pathname === '/' ? '' : url.pathname;
+    return `${url.protocol}//${url.host}${pathname}`;
   }
 
   /**
